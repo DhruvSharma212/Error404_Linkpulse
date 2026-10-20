@@ -56,14 +56,27 @@ Add actual screenshots of your running application here.
 
 Suggested screenshots:
 - Login / Signup
+- <img width="1917" height="1148" alt="image" src="https://github.com/user-attachments/assets/f9cad571-6541-40b5-8693-52e65a63ff97" />
+<img width="1917" height="1150" alt="image" src="https://github.com/user-attachments/assets/25396860-66cc-4b50-8284-833d7141be00" />
+
 - Main Dashboard
+- <img width="1917" height="1152" alt="image" src="https://github.com/user-attachments/assets/b3e31635-99e7-4ffc-9734-c062b9fc0ab3" />
+
 - Short Link Creation
+- <img width="912" height="927" alt="image" src="https://github.com/user-attachments/assets/ee332eb5-035c-4363-b19d-ab11305d9d7e" />
+<img width="1917" height="1138" alt="image" src="https://github.com/user-attachments/assets/f80c7b09-fd64-4122-930a-fd7190f29153" />
+
 - Click Analytics
+- <img width="1911" height="1141" alt="image" src="https://github.com/user-attachments/assets/21b8fe55-0be5-4742-8762-46b6402da87a" />
+
 - LinkGuard Traffic Signals
+- <img width="1917" height="1142" alt="image" src="https://github.com/user-attachments/assets/b519642f-2d62-40e9-9b03-8a995649eedb" />
+
 
 Example Markdown after uploading an image to the repository:
 
-`![LinkPulse Dashboard](screenshots/dashboard.png)`
+<img width="1917" height="1147" alt="image" src="https://github.com/user-attachments/assets/23743325-22dc-455a-b1f9-b84c0003ba26" />
+
 
 ## Local Setup Instructions
 
