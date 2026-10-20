@@ -5,3 +5,4 @@ psycopg2-binary==2.9.10
 python-dotenv==1.0.1
 gunicorn==23.0.0
 qrcode[pil]==8.0
+Flask-JWT-Extended==4.7.1

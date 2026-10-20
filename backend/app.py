@@ -4,25 +4,49 @@ from urllib.parse import urlparse,unquote
 from flask import Flask,request,jsonify,redirect,Response,send_file
 from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
+from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
+from werkzeug.security import generate_password_hash, check_password_hash
 from dotenv import load_dotenv
 import qrcode
 load_dotenv()
 app=Flask(__name__)
+CORS(app, origins=["https://error404-linkpulse.vercel.app"])
+app.config["JWT_SECRET_KEY"] = os.getenv("JWT_SECRET_KEY","local-dev-secret-change-before-deploy")
+jwt = JWTManager(app)
 url=os.getenv("DATABASE_URL","").strip()
 if url.startswith("postgres://"): url=url.replace("postgres://","postgresql://",1)
 app.config["SQLALCHEMY_DATABASE_URI"]=url or "sqlite:///linkpulse.db"
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"]=False
 db=SQLAlchemy(app); CORS(app)
 def now(): return datetime.now(timezone.utc).replace(tzinfo=None)
+
+class User(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(100), nullable=False)
+    email = db.Column(db.String(255), unique=True, nullable=False, index=True)
+    password_hash = db.Column(db.String(255), nullable=False)
+    created_at = db.Column(db.DateTime, default=now)
+
 class Link(db.Model):
- id=db.Column(db.Integer,primary_key=True); code=db.Column(db.String(32),unique=True,nullable=False,index=True)
- original_url=db.Column(db.Text,nullable=False); title=db.Column(db.String(160),default=""); campaign=db.Column(db.String(120),default="General")
- created_at=db.Column(db.DateTime,default=now); expires_at=db.Column(db.DateTime); click_limit=db.Column(db.Integer); is_active=db.Column(db.Boolean,default=True)
- clicks=db.relationship("Click",backref="link",cascade="all, delete-orphan",lazy=True)
+    id=db.Column(db.Integer,primary_key=True)
+    code=db.Column(db.String(32),unique=True,nullable=False,index=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=True, index=True)
+    original_url=db.Column(db.Text,nullable=False)
+    title=db.Column(db.String(160),default="")
+    campaign=db.Column(db.String(120),default="General")
+    created_at=db.Column(db.DateTime,default=now)
+    expires_at=db.Column(db.DateTime)
+    click_limit=db.Column(db.Integer)
+    is_active=db.Column(db.Boolean,default=True)
+    clicks=db.relationship("Click",backref="link",cascade="all, delete-orphan",lazy=True)
 class Click(db.Model):
- id=db.Column(db.Integer,primary_key=True); link_id=db.Column(db.Integer,db.ForeignKey("link.id"),index=True)
- clicked_at=db.Column(db.DateTime,default=now,index=True); referrer=db.Column(db.String(500),default="Direct")
- device=db.Column(db.String(30),default="Desktop"); browser=db.Column(db.String(50),default="Other"); is_bot=db.Column(db.Boolean,default=False)
+    id=db.Column(db.Integer,primary_key=True)
+    link_id=db.Column(db.Integer,db.ForeignKey("link.id"),index=True)
+    clicked_at=db.Column(db.DateTime,default=now,index=True)
+    referrer=db.Column(db.String(500),default="Direct")
+    device=db.Column(db.String(30),default="Desktop")
+    browser=db.Column(db.String(50),default="Other")
+    is_bot=db.Column(db.Boolean,default=False)
 
 class RiskAssessment(db.Model):
  id=db.Column(db.Integer,primary_key=True)
@@ -49,17 +73,44 @@ def state(l):
  return "Active"
 def dto(l):
  return {"id":l.id,"code":l.code,"original_url":l.original_url,"title":l.title or "","campaign":l.campaign or "General","created_at":l.created_at.isoformat()+"Z","expires_at":l.expires_at.isoformat()+"Z" if l.expires_at else None,"click_limit":l.click_limit,"is_active":l.is_active,"status":state(l),"clicks":len(l.clicks),"short_url":f"{base()}/r/{l.code}"}
+@app.get("/r/<code>")
+def redirect_short_link(code):
+    link = Link.query.filter_by(code=code).first_or_404()
+
+    if not link.is_active:
+        return jsonify({"error": "This link is inactive"}), 410
+
+    if link.expires_at and link.expires_at <= now():
+        return jsonify({"error": "This link has expired"}), 410
+
+    if link.click_limit is not None and len(link.clicks) >= link.click_limit:
+        return jsonify({"error": "Click limit reached"}), 410
+
+    device, browser, is_bot = ua(request.headers.get("User-Agent", ""))
+
+    click = Click(
+        link_id=link.id,
+        referrer=(request.referrer or "Direct")[:500],
+        device=device,
+        browser=browser,
+        is_bot=is_bot
+    )
+    db.session.add(click)
+    db.session.commit()
+
+    return redirect(link.original_url, code=302)
+  
 def ua(ua):
  u=ua.lower(); bot=any(x in u for x in ["bot","crawler","spider","preview"])
  device="Mobile" if any(x in u for x in ["mobile","android","iphone"]) else ("Tablet" if "ipad" in u else "Desktop")
  browser="Edge" if "edg/" in u else ("Chrome" if "chrome/" in u else ("Firefox" if "firefox/" in u else ("Safari" if "safari/" in u else "Other")))
  return device,browser,bot
 
-def alerts():
+def alerts(user_id):
     out = []
     t = now()
 
-    for l in Link.query.all():
+    for l in Link.query.filter_by(user_id=user_id).all():
         recent = Click.query.filter(
             Click.link_id == l.id,
             Click.clicked_at >= t - timedelta(minutes=10)
@@ -312,16 +363,79 @@ def analyze_url_risk(raw_url):
             "is safe or malicious."
         )
     }
+    
+
+@app.post("/api/auth/signup")
+def signup():
+    d = request.get_json(silent=True) or {}
+    name = (d.get("name") or "").strip()
+    email = (d.get("email") or "").strip().lower()
+    password = d.get("password") or ""
+
+    if not name or len(name) > 100:
+        return jsonify(error="Enter a name (maximum 100 characters)."), 400
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+        return jsonify(error="Enter a valid email address."), 400
+    if len(password) < 8:
+        return jsonify(error="Password must be at least 8 characters."), 400
+    if User.query.filter_by(email=email).first():
+        return jsonify(error="An account with this email already exists."), 409
+
+    user = User(
+        name=name,
+        email=email,
+        password_hash=generate_password_hash(password)
+    )
+    db.session.add(user)
+    db.session.commit()
+
+    token = create_access_token(identity=str(user.id))
+    return jsonify(
+        token=token,
+        user={"id": user.id, "name": user.name, "email": user.email}
+    ), 201
+
+
+@app.post("/api/auth/login")
+def login():
+    d = request.get_json(silent=True) or {}
+    email = (d.get("email") or "").strip().lower()
+    password = d.get("password") or ""
+
+    user = User.query.filter_by(email=email).first()
+    if not user or not check_password_hash(user.password_hash, password):
+        return jsonify(error="Invalid email or password."), 401
+
+    token = create_access_token(identity=str(user.id))
+    return jsonify(
+        token=token,
+        user={"id": user.id, "name": user.name, "email": user.email}
+    )
 
 @app.get("/")
 def root(): return jsonify({"name":"LinkPulse API","status":"ok","health":"/api/health"})
 @app.get("/api/health")
 def health(): return jsonify({"status":"ok","database":"connected"})
+
 @app.get("/api/links")
+@jwt_required()
 def links():
- q=(request.args.get("q") or "").lower()
- return jsonify([dto(l) for l in Link.query.order_by(Link.created_at.desc()).all() if not q or q in (l.code+" "+l.original_url+" "+(l.title or "")+" "+(l.campaign or "")).lower()])
+    user_id = int(get_jwt_identity())
+    q = (request.args.get("q") or "").lower()
+
+    query = Link.query.filter_by(user_id=user_id).order_by(Link.created_at.desc())
+    items = query.all()
+
+    return jsonify([
+        dto(l) for l in items
+        if not q or q in (
+            l.code + " " + l.original_url + " " +
+            (l.title or "") + " " + (l.campaign or "")
+        ).lower()
+    ])
+
 @app.post("/api/links")
+@jwt_required()
 def create():
  d=request.get_json(silent=True) or {}; u=(d.get("original_url") or "").strip()
  if not valid(u):return jsonify(error="Enter a valid http:// or https:// destination URL."),400
@@ -336,7 +450,7 @@ def create():
  except: return jsonify(error="Click limit must be a positive whole number."),400
  expiry=parse_dt(d.get("expires_at")) if d.get("expires_at") else None
  if d.get("expires_at") and (not expiry or expiry<=now()):return jsonify(error="Expiry must be a valid future date."),400
- l=Link(code=code,original_url=u,title=(d.get("title") or "")[:160],campaign=(d.get("campaign") or "General")[:120],click_limit=limit,expires_at=expiry)
+ l=Link(code=code, user_id=int(get_jwt_identity()), original_url=u, title=(d.get("title") or "")[:160], campaign=(d.get("campaign") or "General")[:120], click_limit=limit, expires_at=expiry)
  
  db.session.add(l)
  db.session.flush()
@@ -352,27 +466,94 @@ def create():
  db.session.commit()
  return jsonify(dto(l)), 201
 
+
 @app.get("/api/analytics")
+@jwt_required()
 def analytics():
- links=Link.query.all(); events=Click.query.order_by(Click.clicked_at.desc()).all(); days={}
- for i in range(6,-1,-1):days[(now()-timedelta(days=i)).date().isoformat()]=0
- devices={}; browsers={}; campaigns={}
- for e in events:
-  day=e.clicked_at.date().isoformat()
-  if day in days:days[day]+=1
-  devices[e.device]=devices.get(e.device,0)+1;browsers[e.browser]=browsers.get(e.browser,0)+1
-  c=e.link.campaign or "General";campaigns[c]=campaigns.get(c,0)+1
- top=sorted([{"code":l.code,"title":l.title or l.code,"clicks":len(l.clicks),"campaign":l.campaign} for l in links],key=lambda x:x["clicks"],reverse=True)[:5]
- return jsonify(total_clicks=len(events),total_links=len(links),active_links=sum(state(l)=="Active" for l in links),flagged_links=len(set(a["link_id"] for a in alerts())),weekly=[{"date":k,"clicks":v} for k,v in days.items()],devices=[{"name":k,"value":v} for k,v in devices.items()],browsers=[{"name":k,"value":v} for k,v in browsers.items()],campaigns=[{"name":k,"clicks":v} for k,v in campaigns.items()],top_links=top,recent_clicks=[{"id":e.id,"code":e.link.code,"clicked_at":e.clicked_at.isoformat()+"Z","device":e.device,"browser":e.browser,"referrer":e.referrer,"is_bot":e.is_bot} for e in events[:10]])
+    user_id = int(get_jwt_identity())
+    links = Link.query.filter_by(user_id=user_id).all()
+    link_ids = [l.id for l in links]
+
+    events = (
+        Click.query.filter(Click.link_id.in_(link_ids))
+        .order_by(Click.clicked_at.desc()).all()
+        if link_ids else []
+    )
+
+    days = {}
+    for i in range(6, -1, -1):
+        days[(now() - timedelta(days=i)).date().isoformat()] = 0
+
+    devices, browsers, campaigns = {}, {}, {}
+    for e in events:
+        day = e.clicked_at.date().isoformat()
+        if day in days:
+            days[day] += 1
+        devices[e.device] = devices.get(e.device, 0) + 1
+        browsers[e.browser] = browsers.get(e.browser, 0) + 1
+        c = e.link.campaign or "General"
+        campaigns[c] = campaigns.get(c, 0) + 1
+
+    top = sorted([
+        {"code": l.code, "title": l.title or l.code,
+         "clicks": len(l.clicks), "campaign": l.campaign}
+        for l in links
+    ], key=lambda x: x["clicks"], reverse=True)[:5]
+
+    link_id_set = set(link_ids)
+    flagged_ids = {
+        a["link_id"] for a in alerts(user_id)
+        if a.get("link_id") in link_id_set
+    }
+
+    return jsonify(
+        total_clicks=len(events),
+        total_links=len(links),
+        active_links=sum(state(l) == "Active" for l in links),
+        flagged_links=len(flagged_ids),
+        weekly=[{"date": k, "clicks": v} for k, v in days.items()],
+        devices=[{"name": k, "value": v} for k, v in devices.items()],
+        browsers=[{"name": k, "value": v} for k, v in browsers.items()],
+        campaigns=[{"name": k, "clicks": v} for k, v in campaigns.items()],
+        top_links=top,
+        recent_clicks=[
+            {"id": e.id, "code": e.link.code,
+             "clicked_at": e.clicked_at.isoformat() + "Z",
+             "device": e.device, "browser": e.browser,
+             "referrer": e.referrer, "is_bot": e.is_bot}
+            for e in events[:10]
+        ]
+    )
+
+
 @app.get("/api/guard")
-def guard():return jsonify(alerts())
+@jwt_required()
+def guard():
+    user_id = int(get_jwt_identity())
+    owned_ids = {
+        row[0] for row in
+        db.session.query(Link.id).filter_by(user_id=user_id).all()
+    }
+
+    return jsonify([
+        alert for alert in alerts(user_id)
+        if alert["link_id"] in owned_ids
+    ])
 
 
 @app.get("/api/incidents")
+@jwt_required()
 def incident_history():
-    rows = SecurityIncident.query.order_by(
-        SecurityIncident.last_seen.desc()
-    ).limit(100).all()
+    user_id = int(get_jwt_identity())
+
+    rows = (
+        SecurityIncident.query
+        .join(Link, SecurityIncident.link_id == Link.id)
+        .filter(Link.user_id == user_id)
+        .order_by(SecurityIncident.last_seen.desc())
+        .limit(100)
+        .all()
+    )
 
     result = []
 
@@ -394,46 +575,140 @@ def incident_history():
     return jsonify(result)
 
 @app.post("/api/links/<int:i>/risk-assessment")
+@jwt_required()
 def assess_link_risk(i):
- l=Link.query.get_or_404(i)
- result=analyze_url_risk(l.original_url)
- assessment=RiskAssessment(link_id=l.id,risk_score=result["risk_score"],risk_level=result["risk_level"],reasons_json=json.dumps(result["reasons"]))
- db.session.add(assessment);db.session.commit()
- result.update({"id":assessment.id,"link_id":l.id,"assessed_at":assessment.assessed_at.isoformat()+"Z","url":l.original_url,"title":l.title or l.code})
- return jsonify(result),201
+    user_id = int(get_jwt_identity())
+    l = Link.query.filter_by(id=i, user_id=user_id).first_or_404()
+
+    result = analyze_url_risk(l.original_url)
+
+    assessment = RiskAssessment(
+        link_id=l.id,
+        risk_score=result["risk_score"],
+        risk_level=result["risk_level"],
+        reasons_json=json.dumps(result["reasons"])
+    )
+
+    db.session.add(assessment)
+    db.session.commit()
+
+    result.update({
+        "id": assessment.id,
+        "link_id": l.id,
+        "assessed_at": assessment.assessed_at.isoformat() + "Z",
+        "url": l.original_url,
+        "title": l.title or l.code
+    })
+
+    return jsonify(result), 201
+
 
 @app.get("/api/links/<int:i>/risk-assessments")
+@jwt_required()
 def link_risk_history(i):
- Link.query.get_or_404(i)
- rows=RiskAssessment.query.filter_by(link_id=i).order_by(RiskAssessment.assessed_at.desc()).limit(50).all()
- return jsonify([{"id":a.id,"link_id":a.link_id,"assessed_at":a.assessed_at.isoformat()+"Z","risk_score":a.risk_score,"risk_level":a.risk_level,"reasons":json.loads(a.reasons_json)} for a in rows])
+    user_id = int(get_jwt_identity())
+    l = Link.query.filter_by(id=i, user_id=user_id).first_or_404()
+
+    rows = (
+        RiskAssessment.query
+        .filter_by(link_id=l.id)
+        .order_by(RiskAssessment.assessed_at.desc())
+        .limit(50)
+        .all()
+    )
+
+    return jsonify([
+        {
+            "id": x.id,
+            "link_id": x.link_id,
+            "risk_score": x.risk_score,
+            "risk_level": x.risk_level,
+            "reasons": json.loads(x.reasons_json or "[]"),
+            "assessed_at": x.assessed_at.isoformat() + "Z"
+        }
+        for x in rows
+    ])
+
+
 
 @app.patch("/api/links/<int:i>")
+@jwt_required()
 def update(i):
- l=Link.query.get_or_404(i);d=request.get_json(silent=True) or {}
- if "is_active" in d:l.is_active=bool(d["is_active"])
- if "title" in d:l.title=(d["title"] or "")[:160]
- db.session.commit();return jsonify(dto(l))
+    user_id = int(get_jwt_identity())
+    l = Link.query.filter_by(id=i, user_id=user_id).first_or_404()
+    d = request.get_json(silent=True) or {}
+
+    if "is_active" in d:
+        l.is_active = bool(d["is_active"])
+    if "title" in d:
+        l.title = (d["title"] or "")[:160]
+
+    db.session.commit()
+    return jsonify(dto(l))
+
+
 @app.delete("/api/links/<int:i>")
+@jwt_required()
 def delete(i):
- l=Link.query.get_or_404(i);db.session.delete(l);db.session.commit();return jsonify(ok=True)
+    user_id = int(get_jwt_identity())
+    l = Link.query.filter_by(id=i, user_id=user_id).first_or_404()
+
+    db.session.delete(l)
+    db.session.commit()
+    return jsonify(ok=True)
+
+
 @app.get("/api/links/<int:i>/qr")
+@jwt_required()
 def qr(i):
- l=Link.query.get_or_404(i);buf=io.BytesIO();qrcode.make(f"{base()}/r/{l.code}").save(buf,format="PNG");buf.seek(0)
- return send_file(buf,mimetype="image/png",download_name=f"linkpulse-{l.code}.png")
+    user_id = int(get_jwt_identity())
+    l = Link.query.filter_by(id=i, user_id=user_id).first_or_404()
+
+    buf = io.BytesIO()
+    qrcode.make(f"{base()}/r/{l.code}").save(buf, format="PNG")
+    buf.seek(0)
+
+    return send_file(
+        buf,
+        mimetype="image/png",
+        download_name=f"linkpulse-{l.code}.png"
+    )
+
+
 @app.get("/api/export.csv")
+@jwt_required()
 def export():
- out=io.StringIO();w=csv.writer(out);w.writerow(["Code","Title","Short URL","Destination","Campaign","Status","Clicks","Created","Expires"])
- for l in Link.query.all():w.writerow([l.code,l.title,f"{base()}/r/{l.code}",l.original_url,l.campaign,state(l),len(l.clicks),l.created_at,l.expires_at or ""])
- return Response(out.getvalue(),mimetype="text/csv",headers={"Content-Disposition":"attachment; filename=linkpulse-links.csv"})
-@app.get("/r/<code>")
-def resolve(code):
- l=Link.query.filter_by(code=code).first()
- if not l:return Response("<h1>Link not found</h1>",404,mimetype="text/html")
- s=state(l)
- if s!="Active":return Response(f"<h1>Link unavailable</h1><p>This link is {s.lower()}.</p>",410,mimetype="text/html")
- device,browser,bot=ua(request.headers.get("User-Agent",""));ref=(request.referrer or "Direct")[:500]
- db.session.add(Click(link_id=l.id,device=device,browser=browser,is_bot=bot,referrer=ref));db.session.commit()
- return redirect(l.original_url,302)
-with app.app_context():db.create_all()
-if __name__=="__main__":app.run(host="0.0.0.0",port=int(os.getenv("PORT",5000)),debug=True)
+    user_id = int(get_jwt_identity())
+    links = (
+        Link.query.filter_by(user_id=user_id)
+        .order_by(Link.created_at.desc())
+        .all()
+    )
+
+    out = io.StringIO()
+    w = csv.writer(out)
+    w.writerow([
+        "Code", "Title", "Short URL", "Destination",
+        "Campaign", "Status", "Clicks", "Created", "Expires"
+    ])
+
+    for l in links:
+        w.writerow([
+            l.code,
+            l.title,
+            f"{base()}/r/{l.code}",
+            l.original_url,
+            l.campaign,
+            state(l),
+            len(l.clicks),
+            l.created_at.isoformat() if l.created_at else "",
+            l.expires_at.isoformat() if l.expires_at else ""
+        ])
+
+    return Response(
+        out.getvalue(),
+        mimetype="text/csv",
+        headers={
+            "Content-Disposition": "attachment; filename=linkpulse-export.csv"
+        }
+    )
