@@ -712,3 +712,5 @@ def export():
             "Content-Disposition": "attachment; filename=linkpulse-export.csv"
         }
     )
+with app.app_context():
+    db.create_all()
